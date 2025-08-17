@@ -1,142 +1,154 @@
-# -----------------------------
-# PROVIDER CONFIGURATION
-# -----------------------------
+# PROVIDER
+# --------
 provider "aws" {
-  region = "us-east-1"  # Set AWS region for all resources
+  region = "us-east-1"  # Set AWS region to us-east-1
 }
 
-# -----------------------------
-# CREATE A KEY PAIR
-# -----------------------------
+# KEY PAIR
+# --------
 resource "aws_key_pair" "my_key" {
   key_name   = "my-ec2-key"                     # Name of the key pair
-  public_key = file("~/.ssh/my-ec2-key.pub")    # Read public key from your local SSH directory
+  public_key = file("~/.ssh/my-ec2-key.pub")   # Use your existing SSH public key file
 }
 
-# -----------------------------
-# SECURITY GROUP FOR EC2 & ALB
-# -----------------------------
+# SECURITY GROUP for EC2 and ALB
+# ------------------------------
 resource "aws_security_group" "web_sg" {
-  name        = "allow_http"                      # Name of the security group
-  description = "Allow HTTP and SSH inbound traffic"
+  name        = "allow_http_ssh"                  # Security group name
+  description = "Allow inbound HTTP (80) and SSH (22) traffic"
 
-  # Allow SSH from anywhere (for remote access)
   ingress {
+    description = "SSH access"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = ["0.0.0.0/0"]                   # Open to anywhere (adjust for security)
   }
 
-  # Allow HTTP traffic from anywhere (for web access)
   ingress {
+    description = "HTTP access"
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = ["0.0.0.0/0"]                   # Open HTTP traffic from anywhere
   }
 
-  # Allow all outbound traffic
   egress {
+    description = "Allow all outbound traffic"
     from_port   = 0
     to_port     = 0
-    protocol    = "-1"              # -1 means all protocols
+    protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
 }
 
-# -----------------------------
 # FETCH DEFAULT VPC AND SUBNETS
 # -----------------------------
 data "aws_vpc" "default" {
-  default = true                     # Use the default VPC in the selected region
+  default = true                         # Select the default VPC in the region
 }
 
 data "aws_subnets" "default" {
   filter {
     name   = "vpc-id"
-    values = [data.aws_vpc.default.id]  # Get subnets that belong to the default VPC
+    values = [data.aws_vpc.default.id]  # Filter subnets belonging to the default VPC
   }
 }
 
-# -----------------------------
-# CREATE 2 EC2 INSTANCES
-# -----------------------------
-resource "aws_instance" "web" {
-  count                  = 2                        # Launch 2 instances
-  ami                    = "ami-0c2b8ca1dad447f8a"  # Amazon Linux 2 AMI (for us-east-1)
-  instance_type          = "t2.micro"               # Small free-tier eligible instance
-  key_name               = aws_key_pair.my_key.key_name  # Use the key pair defined above
-  vpc_security_group_ids = [aws_security_group.web_sg.id] # Attach the security group
-  subnet_id              = data.aws_subnets.default.ids[count.index] # Spread EC2s across subnets
+# LAUNCH TEMPLATE
+# ---------------
+resource "aws_launch_template" "web_lt" {
+  name_prefix   = "web-server-"          # Prefix for LT name
+  image_id      = "ami-0c2b8ca1dad447f8a"  # Amazon Linux 2 AMI ID (us-east-1)
+  instance_type = "t2.micro"              # Instance size
+  key_name      = aws_key_pair.my_key.key_name  # SSH key name to use
+  vpc_security_group_ids = [aws_security_group.web_sg.id]  # Attach security group
 
-  user_data = file("user-data.sh")   # Bootstrap script to install web server
+  # User data script for instance bootstrap (base64 encoded automatically)
+  user_data = filebase64("user-data.sh")
 
-  tags = {
-    Name = "WebServer-${count.index + 1}"   # Give each instance a unique name
+  lifecycle {
+    create_before_destroy = true          # Create new LT before deleting old one on update
   }
 }
 
-# -----------------------------
-# CREATE A TARGET GROUP FOR ALB
-# -----------------------------
-resource "aws_lb_target_group" "web_tg" {
-  name     = "web-tg"
-  port     = 80                          # Target listens on port 80
-  protocol = "HTTP"
-  vpc_id   = data.aws_vpc.default.id
+# AUTO SCALING GROUP (ASG)
+# ------------------------
+resource "aws_autoscaling_group" "web_asg" {
+  desired_capacity     = 2                    # Number of instances to maintain
+  max_size             = 3                    # Maximum number of instances
+  min_size             = 1                    # Minimum number of instances
+  vpc_zone_identifier  = data.aws_subnets.default.ids  # Subnets to launch instances in
 
-  # Health check settings for the ALB to know if instance is healthy
-  health_check {
-    path                = "/"            # Health check URL path
-    protocol            = "HTTP"
-    interval            = 30             # Time between health checks
-    timeout             = 5
-    healthy_threshold   = 2
-    unhealthy_threshold = 2
+  launch_template {
+    id      = aws_launch_template.web_lt.id   # Use Launch Template for config
+    version = "$Latest"
+  }
+
+  target_group_arns = [aws_lb_target_group.web_tg.arn]  # Attach to ALB target group
+
+  health_check_type         = "ELB"       # Use ELB health checks for instances
+  health_check_grace_period = 300         # Wait 5 minutes before checking health
+
+  tag {
+    key                 = "Name"
+    value               = "ASG-WebServer"
+    propagate_at_launch = true            # Apply tag to launched instances
+  }
+
+  force_delete = true                      # Allow deletion of ASG even if instances exist
+}
+
+# SCALING POLICIES
+# ----------------
+resource "aws_autoscaling_policy" "scale_up" {
+  name                   = "scale-up"
+  autoscaling_group_name = aws_autoscaling_group.web_asg.name
+  scaling_adjustment     = 1               # Increase capacity by 1
+  adjustment_type        = "ChangeInCapacity"
+  cooldown               = 300             # Wait 5 minutes before another scaling action
+}
+
+resource "aws_autoscaling_policy" "scale_down" {
+  name                   = "scale-down"
+  autoscaling_group_name = aws_autoscaling_group.web_asg.name
+  scaling_adjustment     = -1              # Decrease capacity by 1
+  adjustment_type        = "ChangeInCapacity"
+  cooldown               = 300
+}
+
+# CLOUDWATCH ALARMS
+# -----------------
+resource "aws_cloudwatch_metric_alarm" "cpu_high" {
+  alarm_name          = "high_cpu_alarm"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2                   # Number of evaluation periods
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = 120                 # Alarm checks every 2 minutes
+  statistic           = "Average"
+  threshold           = 70                  # Alarm triggers if average CPU > 70%
+
+  alarm_actions = [aws_autoscaling_policy.scale_up.arn]  # Trigger scale-up policy
+
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.web_asg.name
   }
 }
 
-# -----------------------------
-# ATTACH EC2 INSTANCES TO ALB TARGET GROUP
-# -----------------------------
-resource "aws_lb_target_group_attachment" "web_attachments" {
-  count            = 2                                          # Attach both instances
-  target_group_arn = aws_lb_target_group.web_tg.arn             # Reference the target group
-  target_id        = aws_instance.web[count.index].id           # Target is the EC2 instance
-  port             = 80                                         # Instance listens on port 80
-}
+resource "aws_cloudwatch_metric_alarm" "cpu_low" {
+  alarm_name          = "low_cpu_alarm"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = 120
+  statistic           = "Average"
+  threshold           = 30                  # Alarm triggers if average CPU < 30%
 
-# -----------------------------
-# CREATE APPLICATION LOAD BALANCER
-# -----------------------------
-resource "aws_lb" "web_alb" {
-  name               = "web-alb"
-  internal           = false                                   # Set to false so it's internet-facing
-  load_balancer_type = "application"                           # Type is Application Load Balancer (ALB)
-  security_groups    = [aws_security_group.web_sg.id]          # Attach same security group as EC2
-  subnets            = data.aws_subnets.default.ids            # Spread ALB across all subnets
+  alarm_actions = [aws_autoscaling_policy.scale_down.arn]  # Trigger scale-down policy
 
-  enable_deletion_protection = false
-}
-
-# -----------------------------
-# ALB LISTENER - HTTP TRAFFIC
-# -----------------------------
-resource "aws_lb_listener" "web_listener" {
-  load_balancer_arn = aws_lb.web_alb.arn     # Reference the ALB
-  port              = 80                     # Listen on port 80
-  protocol          = "HTTP"
-
-  default_action {
-    type             = "forward"                     # Forward traffic to target group
-    target_group_arn = aws_lb_target_group.web_tg.arn
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.web_asg.name
   }
-}
-
-# -----------------------------
-# OUTPUT THE ALB DNS NAME
-# -----------------------------
-output "alb_dns_name" {
-  value = aws_lb.web_alb.dns_name           # Print ALB public DNS after apply
 }
